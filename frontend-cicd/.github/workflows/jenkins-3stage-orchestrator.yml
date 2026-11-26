@@ -38,8 +38,10 @@ on:
         required: false
         default: ""
 
-# Per-branch/env serialization: different release branches run in parallel,
-# while merges to the SAME release branch queue strictly without cancelling in-flight deploys!
+# Per-branch/env serialization + AUTOMATIC COALESCING for ~47-min pipelines (CI 15m + Release 25m + CD 7m):
+# GitHub Actions keeps at most 1 RUNNING + 1 PENDING run per group when cancel-in-progress=false.
+# If PR #2, #3, #4 merge while PR #1 is deploying, #2/#3 are superseded by #4 (which already contains
+# #2+#3+#4 on the branch), preventing a 3+ hour queue pile-up while NEVER cancelling an in-flight deploy!
 concurrency:
   group: jenkins-3stage-${{ github.event.client_payload.override_env || github.event.client_payload.branch || inputs.override_env || inputs.branch }}
   cancel-in-progress: false
@@ -47,6 +49,8 @@ concurrency:
 jobs:
   orchestrate:
     runs-on: [self-hosted]
+    # 47 min typical run + up to 40 min waiting for a colleague's manual Jenkins job -> 130 min hard cap
+    timeout-minutes: 130
     steps:
       - uses: actions/checkout@v4
 

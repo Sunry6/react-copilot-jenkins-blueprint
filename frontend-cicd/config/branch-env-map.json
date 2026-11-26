@@ -5,6 +5,13 @@
     "release": "dev/react-demo-release",
     "cd": "uat/react-demo-cd"
   },
+  "stageTimeoutsSec": {
+    "ci": 1800,
+    "release": 2700,
+    "cd": 1200,
+    "conflictWait": 2400,
+    "pollInterval": 20
+  },
   "branchToEnv": {
     "develop-202701": {
       "env": "env3",

@@ -32,7 +32,8 @@
    - 我们无 Jenkins 管理员权限，不得要求安装 Jenkins 插件；
    - 公司未开启 Copilot MCP，采用合规的仓库只读 CLI 脚本（jenkins-inspect.mjs），不得尝试绕过或伪装 MCP；
    - 凭据隔离：Jenkins Token 与 Teams Webhook 仅放在 CICD 仓库 Secrets 中；
-   - 必须保留外部同事手动跑同环境 Job 时的占坑检测与礼貌等待机制，以及失败时断点续跑与 Teams 卡片告警。
+   - 必须保留外部同事手动跑同环境 Job 时的占坑检测与礼貌等待机制，以及失败时断点续跑与 Teams 卡片告警；
+   - 注意我们的实际耗时（CI ~15m、Release ~25m、CD ~7m，全程约 47m）：务必按阶段设置充裕超时（如 CI 30m / Release 45m / CD 20m / 冲突等待 40m / Actions 总超时 130m）、轮询间隔 20s，并利用 GHES `concurrency (cancel-in-progress: false)` 实现多 PR 自动合批防堆积。
 
 请输出一份针对我们真实项目的《差异对照表 + 改造实施清单》，列出所有需要确认的真实 Job 名、参数名和变量名，等待我确认后再动手修改文件。
 ```

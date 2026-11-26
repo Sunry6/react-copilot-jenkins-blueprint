@@ -255,6 +255,7 @@ async function triggerAndWaitBuild({
 
   const bStart = Date.now();
   let result = null;
+  let lastHeartbeat = bStart;
   while ((Date.now() - bStart) / 1000 < maxBuildSec) {
     const bData = await jenkinsJson(
       jenkinsUrl,
@@ -264,13 +265,19 @@ async function triggerAndWaitBuild({
       result = bData.result;
       break;
     }
+    const elapsedSec = Math.round((Date.now() - bStart) / 1000);
+    if (Date.now() - lastHeartbeat >= 60_000) {
+      console.log(`⏱️  ${logicalJob} #${buildNumber} still running (${Math.floor(elapsedSec / 60)}m ${elapsedSec % 60}s elapsed)...`);
+      lastHeartbeat = Date.now();
+    }
     await sleep(pollIntervalSec * 1000);
   }
 
+  const totalSec = Math.round((Date.now() - bStart) / 1000);
   const consoleText = await jenkinsText(jenkinsUrl, `${jobPath}/${buildNumber}/consoleText`);
   if (result !== "SUCCESS") {
     const tail = consoleText.split("\n").slice(-80).join("\n");
-    const err = new Error(`${logicalJob} #${buildNumber} finished with status: ${result || "TIMEOUT"}`);
+    const err = new Error(`${logicalJob} #${buildNumber} finished with status: ${result || "TIMEOUT"} after ${totalSec}s`);
     err.stageJob = logicalJob;
     err.buildNumber = buildNumber;
     err.buildUrl = buildUrl;
@@ -278,8 +285,8 @@ async function triggerAndWaitBuild({
     throw err;
   }
 
-  console.log(`✅ ${logicalJob} #${buildNumber} SUCCEEDED.`);
-  return { buildNumber, buildUrl, consoleText };
+  console.log(`✅ ${logicalJob} #${buildNumber} SUCCEEDED in ${Math.floor(totalSec / 60)}m ${totalSec % 60}s.`);
+  return { buildNumber, buildUrl, consoleText, elapsedSec: totalSec };
 }
 
 function parseOutputVar(consoleText, key) {
@@ -288,7 +295,7 @@ function parseOutputVar(consoleText, key) {
   return m ? m[1].trim() : "";
 }
 
-function buildTeamsAdaptiveCard({ status, branch, env, uatAlias, commit, prNumber, prUrl, author, failedStage, buildNumber, buildUrl, releaseVersion, previewUrl, errorExcerpt, resumeUrl }) {
+function buildTeamsAdaptiveCard({ status, branch, env, uatAlias, commit, prNumber, prUrl, author, failedStage, failedStageKey, buildNumber, buildUrl, artifactVersion, releaseVersion, previewUrl, errorExcerpt, resumeUrl }) {
   const isSuccess = status === "SUCCESS";
   const title = isSuccess
     ? `✅ React 发布成功 | ${branch} → ${uatAlias} (${env})`
@@ -303,9 +310,18 @@ function buildTeamsAdaptiveCard({ status, branch, env, uatAlias, commit, prNumbe
     { title: "Commit", value: (commit || "N/A").slice(0, 10) },
     { title: "PR / 提交人", value: prNumber ? `#${prNumber} (@${author || "unknown"})` : author || "manual" },
   ];
+  if (artifactVersion) facts.push({ title: "CI 产物版本", value: artifactVersion });
   if (releaseVersion) facts.push({ title: "Release 版本", value: releaseVersion });
   if (isSuccess && previewUrl) facts.push({ title: "预览地址", value: previewUrl });
-  if (!isSuccess) facts.push({ title: "失败阶段", value: `${failedStage} #${buildNumber || "?"}` });
+  if (!isSuccess) {
+    facts.push({ title: "失败阶段", value: `${failedStage} #${buildNumber || "?"}` });
+    if (failedStageKey && failedStageKey !== "ci") {
+      facts.push({
+        title: "免重跑续跑参数",
+        value: `start_from=${failedStageKey}${artifactVersion ? `, artifact_version=${artifactVersion}` : ""}${releaseVersion ? `, release_version=${releaseVersion}` : ""}`,
+      });
+    }
+  }
 
   const body = [
     {
@@ -395,9 +411,12 @@ async function main() {
   const branch = args.branch || process.env.TARGET_BRANCH || "develop-202701";
   const commit = args.commit || process.env.TARGET_COMMIT || "";
   const startFrom = (args["start-from"] || "ci").toLowerCase();
-  const maxWaitConflictSec = Number(args["max-wait-conflict"] || 1200);
-  const maxBuildSec = Number(args["max-build-sec"] || 1800);
-  const pollIntervalSec = Number(args["poll-interval"] || 5);
+  const timeouts = config.stageTimeoutsSec || {};
+  const maxWaitConflictSec = Number(args["max-wait-conflict"] || timeouts.conflictWait || 2400);
+  const ciTimeoutSec = Number(args["ci-timeout-sec"] || args["max-build-sec"] || timeouts.ci || 1800);
+  const releaseTimeoutSec = Number(args["release-timeout-sec"] || args["max-build-sec"] || timeouts.release || 2700);
+  const cdTimeoutSec = Number(args["cd-timeout-sec"] || args["max-build-sec"] || timeouts.cd || 1200);
+  const pollIntervalSec = Number(args["poll-interval"] || timeouts.pollInterval || 20);
 
   const mapped = config.branchToEnv[branch];
   const targetEnv = args.env || mapped?.env;
@@ -411,15 +430,19 @@ async function main() {
   }
 
   console.log(`=== 3-Stage Jenkins Orchestrator ===`);
-  console.log(`Branch: ${branch} -> Target Env: ${targetEnv} (${uatAlias}) | Start From: ${startFrom}`);
+  console.log(
+    `Branch: ${branch} -> Target Env: ${targetEnv} (${uatAlias}) | Start From: ${startFrom} | Timeouts(s): CI=${ciTimeoutSec}, Release=${releaseTimeoutSec}, CD=${cdTimeoutSec}, ConflictWait=${maxWaitConflictSec}, Poll=${pollIntervalSec}s`
+  );
 
   let artifactVersion = args["artifact-version"] || "";
   let releaseVersion = args["release-version"] || "";
   let lastBuildUrl = "";
+  let currentStageKey = startFrom;
 
   try {
-    // Stage 1: dev/<app>-ci
+    // Stage 1: dev/<app>-ci (~15 min typical -> 30 min timeout)
     if (startFrom === "ci") {
+      currentStageKey = "ci";
       const ciRes = await triggerAndWaitBuild({
         jenkinsUrl,
         logicalJob: config.jenkinsJobs.ci,
@@ -431,7 +454,7 @@ async function main() {
         },
         targetEnv,
         maxWaitConflictSec,
-        maxBuildSec,
+        maxBuildSec: ciTimeoutSec,
         pollIntervalSec,
       });
       artifactVersion = parseOutputVar(ciRes.consoleText, "ARTIFACT_VERSION") || `${branch}-ci.${ciRes.buildNumber}`;
@@ -439,8 +462,9 @@ async function main() {
       console.log(`🔗 Captured ARTIFACT_VERSION=${artifactVersion}`);
     }
 
-    // Stage 2: dev/<app>-release
+    // Stage 2: dev/<app>-release (~25 min typical -> 45 min timeout)
     if (startFrom === "ci" || startFrom === "release") {
+      currentStageKey = "release";
       if (!artifactVersion) {
         throw new Error("--artifact-version is required when resuming from --start-from release");
       }
@@ -455,7 +479,7 @@ async function main() {
         },
         targetEnv,
         maxWaitConflictSec,
-        maxBuildSec,
+        maxBuildSec: releaseTimeoutSec,
         pollIntervalSec,
       });
       releaseVersion = parseOutputVar(relRes.consoleText, "RELEASE_VERSION") || `rel-${relRes.buildNumber}`;
@@ -463,8 +487,9 @@ async function main() {
       console.log(`🔗 Captured RELEASE_VERSION=${releaseVersion}`);
     }
 
-    // Stage 3: uat/<app>-cd
+    // Stage 3: uat/<app>-cd (~7 min typical -> 20 min timeout)
     if (startFrom === "ci" || startFrom === "release" || startFrom === "cd") {
+      currentStageKey = "cd";
       if (!releaseVersion) {
         throw new Error("--release-version is required when resuming from --start-from cd");
       }
@@ -479,7 +504,7 @@ async function main() {
         },
         targetEnv,
         maxWaitConflictSec,
-        maxBuildSec,
+        maxBuildSec: cdTimeoutSec,
         pollIntervalSec,
       });
       lastBuildUrl = cdRes.buildUrl;
@@ -509,14 +534,15 @@ async function main() {
     await sendTeamsNotification(card);
     console.log(`\n🎉 Full 3-Stage Pipeline SUCCEEDED! (${branch} -> ${uatAlias}/${targetEnv}, release=${releaseVersion})`);
   } catch (err) {
-    console.error(`\n❌ Pipeline failed: ${err.message}`);
+    console.error(`\n❌ Pipeline failed at stage=${currentStageKey}: ${err.message}`);
     const failureRecord = {
       status: "FAILURE",
       branch,
       env: targetEnv,
       uatAlias,
       commit,
-      failedStage: err.stageJob || startFrom,
+      failedStage: err.stageJob || currentStageKey,
+      failedStageKey: currentStageKey,
       buildNumber: err.buildNumber || "",
       buildUrl: err.buildUrl || lastBuildUrl,
       artifactVersion,
