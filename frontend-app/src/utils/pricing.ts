@@ -26,6 +26,8 @@ export function calculateCartTotal(items: CartItem[], options: PricingOptions = 
   if (couponCode) {
     if (couponCode === "SAVE10") {
       total = total * 0.9;
+    } else if (couponCode === "VIP20") {
+      total = total * 0.8;
     } else if (couponCode === "FLAT5") {
       total = Math.max(0, total - 5);
     } else {
