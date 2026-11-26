@@ -78,9 +78,15 @@ jobs:
         run: |
           set -euo pipefail
           EXTRA_ARGS=()
-          [ -n "${OVERRIDE_ENV}" ] && EXTRA_ARGS+=(--env "${OVERRIDE_ENV}")
-          [ -n "${ARTIFACT_VERSION}" ] && EXTRA_ARGS+=(--artifact-version "${ARTIFACT_VERSION}")
-          [ -n "${RELEASE_VERSION}" ] && EXTRA_ARGS+=(--release-version "${RELEASE_VERSION}")
+          if [ -n "${OVERRIDE_ENV}" ]; then
+            EXTRA_ARGS+=(--env "${OVERRIDE_ENV}")
+          fi
+          if [ -n "${ARTIFACT_VERSION}" ]; then
+            EXTRA_ARGS+=(--artifact-version "${ARTIFACT_VERSION}")
+          fi
+          if [ -n "${RELEASE_VERSION}" ]; then
+            EXTRA_ARGS+=(--release-version "${RELEASE_VERSION}")
+          fi
 
           node scripts/jenkins-orchestrator.mjs \
             --branch "${TARGET_BRANCH}" \
@@ -91,7 +97,7 @@ jobs:
             --author "${PR_AUTHOR}" \
             --resume-url "${RESUME_URL}" \
             --output-json pipeline-result.json \
-            "${EXTRA_ARGS[@]}"
+            ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
 
       - name: Post Result Comment Back to Original App PR (for Copilot Desktop My Work)
         if: always() && github.event_name == 'repository_dispatch' && github.event.client_payload.pr_number != ''
