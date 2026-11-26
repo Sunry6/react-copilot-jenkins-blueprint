@@ -1,37 +1,77 @@
 name: Notify CICD Repo After PR Merge
 
-# Runs ONLY after all PR gates passed + Leader approved + PR is actually merged into develop-*
+# Supports two low-load trigger modes via repository variable DEPLOY_TRIGGER_MODE:
+#   - "opt-in" (default, recommended for ~47m pipelines): only deploys when PR has label `deploy:auto` or `deploy:<env>`
+#   - "auto": deploys on every merge to `develop-*` unless labeled `deploy:skip`
+# Also supports on-demand `/deploy` comment on a merged PR.
 on:
   pull_request:
     types: [closed]
     branches:
       - "develop-*"
+  issue_comment:
+    types: [created]
 
 jobs:
   dispatch-to-cicd:
-    if: github.event.pull_request.merged == true
+    if: |
+      (github.event_name == 'pull_request' && github.event.pull_request.merged == true) ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request && startsWith(github.event.comment.body, '/deploy'))
     runs-on: [self-hosted]
     steps:
-      - name: Dispatch deployment event to dedicated CICD repository
+      - name: Resolve PR Metadata & Dispatch to CICD Repository
         env:
-          # Fine-grained PAT / GitHub App token with ONLY repository_dispatch permission on CICD repo.
-          # Notice: NO Jenkins credentials ever live in the frontend app repo!
           CICD_DISPATCH_TOKEN: ${{ secrets.CICD_DISPATCH_TOKEN }}
-          CICD_REPO: ${{ vars.CICD_REPO }} # e.g. my-org/frontend-cicd
-          GH_API_URL: ${{ github.api_url }} # Automatically points to your internal GHES API URL
-          PR_TITLE: ${{ github.event.pull_request.title }}
-          PR_LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          CICD_REPO: ${{ vars.CICD_REPO }}
+          DEPLOY_TRIGGER_MODE: ${{ vars.DEPLOY_TRIGGER_MODE || 'opt-in' }}
+          GH_API_URL: ${{ github.api_url }}
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+          PR_TITLE: ${{ github.event.pull_request.title || github.event.issue.title }}
+          PR_URL: ${{ github.event.pull_request.html_url || github.event.issue.html_url }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login || github.event.issue.user.login }}
+          BASE_REF: ${{ github.base_ref }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name || github.event.issue.labels.*.name) }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
         run: |
           set -euo pipefail
-          OVERRIDE_ENV=$(node -e "
-            const labels = JSON.parse(process.env.PR_LABELS_JSON || '[]');
-            const found = labels.find(l => l.startsWith('deploy:'));
-            console.log(found ? found.replace('deploy:', '') : '');
-          ")
+          BRANCH="${BASE_REF}"
+          COMMIT_SHA="${MERGE_SHA}"
+          OVERRIDE_ENV=""
 
-          if [ "$OVERRIDE_ENV" = "skip" ]; then
-            echo "PR labeled with deploy:skip — skipping automatic Jenkins pipeline."
-            exit 0
+          # When triggered via `/deploy` or `/deploy env3` comment, fetch PR details to verify it is merged
+          if [ "${EVENT_NAME}" = "issue_comment" ]; then
+            PR_JSON=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" "${GH_API_URL}/repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")
+            IS_MERGED=$(echo "$PR_JSON" | node -e "const d=JSON.parse(require('fs').readFileSync(0,'utf8')); console.log(Boolean(d.merged));")
+            if [ "$IS_MERGED" != "true" ]; then
+              echo "PR #${PR_NUMBER} is not merged yet. Ignoring /deploy command."
+              exit 0
+            fi
+            BRANCH=$(echo "$PR_JSON" | node -e "const d=JSON.parse(require('fs').readFileSync(0,'utf8')); console.log(d.base.ref);")
+            COMMIT_SHA=$(echo "$PR_JSON" | node -e "const d=JSON.parse(require('fs').readFileSync(0,'utf8')); console.log(d.merge_commit_sha || '');")
+            OVERRIDE_ENV=$(echo "${COMMENT_BODY}" | awk '{print $2}' || true)
+          else
+            LABEL_VALUE=$(node -e "
+              const labels = JSON.parse(process.env.LABELS_JSON || '[]');
+              const found = labels.find(l => l.startsWith('deploy:'));
+              console.log(found ? found.replace('deploy:', '') : '');
+            ")
+
+            if [ "$LABEL_VALUE" = "skip" ]; then
+              echo "PR labeled deploy:skip — skipping pipeline."
+              exit 0
+            fi
+
+            if [ "${DEPLOY_TRIGGER_MODE}" = "opt-in" ] && [ -z "$LABEL_VALUE" ]; then
+              echo "DEPLOY_TRIGGER_MODE=opt-in and no deploy:* label present — skipping auto deploy (comment /deploy or wait for scheduled release train)."
+              exit 0
+            fi
+
+            if [ "$LABEL_VALUE" != "auto" ]; then
+              OVERRIDE_ENV="$LABEL_VALUE"
+            fi
           fi
 
           PAYLOAD=$(node -e "
@@ -39,17 +79,16 @@ jobs:
               event_type: 'frontend-pr-merged',
               client_payload: {
                 app_repo: process.env.GITHUB_REPOSITORY,
-                branch: '${{ github.base_ref }}',
-                commit_sha: '${{ github.event.pull_request.merge_commit_sha }}',
-                pr_number: '${{ github.event.pull_request.number }}',
+                branch: process.argv[1],
+                commit_sha: process.argv[2],
+                pr_number: process.env.PR_NUMBER,
                 pr_title: process.env.PR_TITLE,
-                pr_url: '${{ github.event.pull_request.html_url }}',
-                author: '${{ github.event.pull_request.user.login }}',
-                merged_by: '${{ github.event.pull_request.merged_by.login }}',
-                override_env: '${OVERRIDE_ENV}'
+                pr_url: process.env.PR_URL,
+                author: process.env.PR_AUTHOR,
+                override_env: process.argv[3]
               }
             }));
-          ")
+          " "$BRANCH" "$COMMIT_SHA" "$OVERRIDE_ENV")
 
           curl -fsSL -X POST \
             -H "Accept: application/vnd.github+json" \
@@ -57,4 +96,4 @@ jobs:
             "${GH_API_URL}/repos/${CICD_REPO}/dispatches" \
             -d "$PAYLOAD"
 
-          echo "✅ Dispatched merge event for PR #${{ github.event.pull_request.number }} (${{ github.base_ref }}) -> ${CICD_REPO}"
+          echo "✅ Dispatched deploy request for PR #${PR_NUMBER} (${BRANCH}) -> ${CICD_REPO}"

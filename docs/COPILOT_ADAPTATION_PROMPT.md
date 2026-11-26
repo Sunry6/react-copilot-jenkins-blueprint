@@ -1,20 +1,18 @@
-# 给公司 Enterprise Copilot 使用的自动适配 Prompt
+# Copilot 自动适配 Prompt 模板
 
-> **使用方式**：
-> 1. 在公司电脑克隆本模板仓库到业务项目同级目录；
-> 2. 用 **Copilot Desktop**（同时添加本模板仓 + 公司 React 仓 + 公司 CICD 仓）或 **Copilot CLI**：
->    ```bash
->    cd /path/to/company-react-repo
->    copilot --add-dir ../react-copilot-jenkins-blueprint --add-dir ../company-cicd-repo
->    ```
-> 3. 直接把下面对应阶段的 Prompt 发给 Copilot（推荐选 Claude Opus / 顶级推理模型）。
+使用方法：将本模板仓库与目标 React 业务仓、独立 CICD 仓同时挂载到 Copilot Desktop 或 Copilot CLI：
+
+```bash
+cd /path/to/your-react-app
+copilot --add-dir ../react-copilot-jenkins-blueprint --add-dir ../your-cicd-repo
+```
 
 ---
 
-## Prompt 1：让 Copilot 扫描公司双仓并产出定制化改造方案（先规划，不直接改代码）
+## Prompt 1：双仓扫描与差异分析（先规划，不直接修改）
 
 ```text
-请先完整阅读参考模板仓库 `../react-copilot-jenkins-blueprint` 中的：
+请先阅读参考模板仓库 `../react-copilot-jenkins-blueprint` 的以下文件：
 - README.md
 - docs/MIGRATION_GUIDE.md
 - frontend-app/.github/workflows/pr-gate.yml & trigger-cicd.yml
@@ -22,48 +20,45 @@
 - frontend-cicd/config/branch-env-map.json
 - frontend-cicd/scripts/jenkins-orchestrator.mjs & jenkins-inspect.mjs
 - frontend-cicd/.github/workflows/jenkins-3stage-orchestrator.yml
+- frontend-cicd/.github/workflows/jenkins-callback-orchestrator.yml
+- frontend-cicd/.github/workflows/release-train.yml
+- frontend-cicd/snippets/jenkins-callback.groovy
 
-然后仔细分析我们当前真实的 React 业务仓库和 `../company-cicd-repo` 仓库：
-1. 识别我们现有的 git hooks（ggshield / oxlint / eslint / commitlint / vitest related）、包管理器（npm / pnpm / yarn）以及 Node 版本；
-2. 识别 `../company-cicd-repo` 中已有的 Jenkinsfile、环境列表（如 env1-env5, sim）和真实的 3 个 Jenkins Job 路径与入参名称（dev 下的 CI/Release、uat 下的 CD）；
-3. 识别我们现有的分支命名规范（如 develop-YYYYMM 对应 uatX）；
-4. 严格遵守以下约束：
-   - 单点门禁（不重复跑两遍）：本地 `pre-commit` 仅保留 `<1s` 的 `ggshield` 防止密文被 push；`oxlint`/`eslint` + commit message 校验 + PR 级 `vitest related`（改动全局配置时兜底全量）统一在 GHES PR Gate 跑一遍，不跑 build；
-   - 我们无 Jenkins 管理员权限，不得要求安装 Jenkins 插件；
-   - 公司未开启 Copilot MCP，采用合规的仓库只读 CLI 脚本（jenkins-inspect.mjs），不得尝试绕过或伪装 MCP；
-   - 凭据隔离：Jenkins Token 与 Teams Webhook 仅放在 CICD 仓库 Secrets 中；
-   - 必须保留外部同事手动跑同环境 Job 时的占坑检测与礼貌等待机制，以及失败时断点续跑与 Teams 卡片告警；
-   - 注意我们的实际耗时（CI ~15m、Release ~25m、CD ~7m，全程约 47m）：务必按阶段设置充裕超时（如 CI 30m / Release 45m / CD 20m / 冲突等待 40m / Actions 总超时 130m）、轮询间隔 20s，并利用 GHES `concurrency (cancel-in-progress: false)` 实现多 PR 自动合批防堆积。
+然后分析当前 React 业务仓和 `../your-cicd-repo`：
+1. 识别现有的包管理器、Node 版本、oxlint/eslint/commitlint/vitest/ggshield 配置；
+2. 识别 `../your-cicd-repo` 中已有的 Jenkinsfile、环境列表（如 env1-env5, sim）和 3 个 Jenkins Job 的真实路径与参数名（dev 下的 CI/Release、uat 下的 CD）；
+3. 判断 `../your-cicd-repo` 中的 Jenkinsfile 是否允许添加 `post` 回调（决定采用零轮询 Push 回调模式，还是零侵入轮询模式）；
+4. 严格遵守以下架构约束：
+   - 单点 PR 门禁：本地 pre-commit 仅保留 <1s 的 ggshield；oxlint/eslint、commit message 校验、PR 级 vitest related（改全局配置兜底全量）统一在 GHES PR Gate 执行一遍，不跑 build；
+   - 无 Jenkins 管理员权限，不依赖新增 Jenkins 插件；
+   - 未开启 Copilot MCP，使用仓库内只读 CLI 脚本（jenkins-inspect.mjs）供 Copilot 排障；
+   - 凭据隔离：Jenkins Token 与 Teams Webhook 仅存于 CICD 仓库 Secrets；
+   - 适配长耗时流水线（CI ~15m、Release ~25m、CD ~7m）：支持按需标签/`/deploy` 或定时班车合批防过载，保留占坑避让、断点续跑与 Teams 告警卡片。
 
-请输出一份针对我们真实项目的《差异对照表 + 改造实施清单》，列出所有需要确认的真实 Job 名、参数名和变量名，等待我确认后再动手修改文件。
+请输出《差异对照表 + 推荐模式选型 + 改造实施清单》，列出需要确认的真实 Job 名、参数名和变量名，等我确认后再修改文件。
 ```
 
 ---
 
-## Prompt 2：确认参数后，让 Copilot 落地 Phase 1（业务仓 PR 门禁 + Copilot 规范）
+## Prompt 2：落地 React 业务仓改造（Phase 1）
 
 ```text
-请严格按照你刚才输出的方案和我确认的参数，在当前 React 业务仓库创建一个新分支 `chore/setup-pr-gate-and-copilot-workflow`，完成以下改造：
-1. 生成 `.github/workflows/pr-gate.yml`（匹配我们真实的包管理器、oxlint/eslint 命令、commitlint 和 PR 级 vitest related，不跑 build）；
-2. 生成 `.github/workflows/trigger-cicd.yml`（仅在 PR 合并到 `develop-*` 分支后跨仓 dispatch 到我们的 CICD 仓库，不引入任何 Jenkins 凭据）；
-3. 生成或更新 `.github/copilot-instructions.md` 和 `.github/skills/ship-pr/SKILL.md`；
-4. 检查本地 pre-commit/commit-msg hooks，确保与 PR 门禁口径一致；
-5. 运行本地 lint 和相关单测验证所有修改无语法或配置错误，然后展示 diff 给我审核。
+按刚才确认的方案，在当前 React 业务仓库创建分支 `chore/setup-pr-gate-and-copilot-workflow` 并完成改造：
+1. 精简本地 pre-commit hook 仅保留 ggshield；
+2. 生成 `.github/workflows/pr-gate.yml`（匹配真实包管理器与脚本，无 build，PR 级 vitest related）；
+3. 生成 `.github/workflows/trigger-cicd.yml`（支持 opt-in 标签与 `/deploy` 评论触发，零 Jenkins 凭据）；
+4. 生成 `.github/copilot-instructions.md` 和 `.github/skills/ship-pr/SKILL.md`；
+5. 运行本地 lint 和相关单测验证配置无误后，展示 diff 供审核。
 ```
 
 ---
 
-## Prompt 3：落地 Phase 2（独立 CICD 仓库的三段编排 + 占坑避让 + 只读排障脚本）
+## Prompt 3：落地独立 CICD 仓库改造（Phase 2）
 
 ```text
-请切换到 `../company-cicd-repo` 创建新分支 `feat/jenkins-3stage-orchestrator`，参考 `../react-copilot-jenkins-blueprint/frontend-cicd/` 完成适配：
-1. 创建 `config/branch-env-map.json`，填入我们真实活跃的 `develop-YYYYMM` 分支与 `env1-env5`/`sim` 映射以及真实的 3 个 Jenkins Job 路径；
-2. 适配 `scripts/jenkins-orchestrator.mjs`：
-   - 对齐 3 个 Job 的真实参数名（例如分支、环境、版本号参数）；
-   - 对齐从 CI / Release 日志或 API 中提取精确版本号的规则；
-   - 保留触发前的 Jenkins 运行中 Build + Queue 占坑冲突检测与自动等待；
-   - 保留 Teams Workflows Adaptive Card 告警与成功推送；
-3. 适配只读排障脚本 `scripts/jenkins-inspect.mjs`（严格只读 GET API，零写入/触发操作）；
-4. 生成 `.github/workflows/jenkins-3stage-orchestrator.yml`（带按环境分桶的 `concurrency` 锁、`workflow_dispatch` 断点续跑、以及结果回写原 PR 评论）；
-5. 用 `node --check` 校验所有脚本语法，并给出干跑（Dry-Run）测试命令给我验证。
+在 `../your-cicd-repo` 创建分支 `feat/jenkins-3stage-orchestrator`，按已选定的编排模式（Push 回调模式或轮询模式）与触发节奏完成适配：
+1. 创建 `config/branch-env-map.json`，填入真实活跃的 `develop-YYYYMM` 分支映射、3 个 Jenkins Job 路径及分阶段超时参数；
+2. 适配对应 Workflow（`jenkins-callback-orchestrator.yml` 或 `jenkins-3stage-orchestrator.yml`）与可选 `release-train.yml`；
+3. 适配 `scripts/jenkins-orchestrator.mjs`（若选轮询模式）和只读排障脚本 `scripts/jenkins-inspect.mjs`；
+4. 用 `node --check` 校验所有脚本语法并给出干跑验证命令。
 ```

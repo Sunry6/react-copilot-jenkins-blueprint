@@ -1,0 +1,139 @@
+name: Jenkins Event-Driven Push Orchestrator (Zero-Polling)
+
+# Event-driven alternative to synchronous polling:
+# Each stage triggers Jenkins and exits in ~3 seconds (zero Runner lock during 47m builds!).
+# Jenkins sends a lightweight `repository_dispatch` callback from its `post { always { ... } }` block
+# to advance CI -> Release -> CD automatically.
+#
+# Pair with the Jenkinsfile callback snippet in `frontend-cicd/snippets/jenkins-callback.groovy`.
+on:
+  repository_dispatch:
+    types:
+      - frontend-pr-merged-push
+      - jenkins-ci-finished
+      - jenkins-release-finished
+      - jenkins-cd-finished
+
+jobs:
+  handle-event:
+    runs-on: [self-hosted]
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Route Push Event & Trigger Next Stage (Fire-and-Forget)
+        env:
+          EVENT_TYPE: ${{ github.event.action }}
+          PAYLOAD_JSON: ${{ toJSON(github.event.client_payload) }}
+          JENKINS_URL: ${{ secrets.JENKINS_URL }}
+          JENKINS_USER: ${{ secrets.JENKINS_USER }}
+          JENKINS_API_TOKEN: ${{ secrets.JENKINS_API_TOKEN }}
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("fs");
+            const cfg = JSON.parse(fs.readFileSync("config/branch-env-map.json", "utf8"));
+            const eventType = process.env.EVENT_TYPE;
+            const p = JSON.parse(process.env.PAYLOAD_JSON || "{}");
+            const auth = "Basic " + Buffer.from(`${process.env.JENKINS_USER}:${process.env.JENKINS_API_TOKEN}`).toString("base64");
+            const jenkinsUrl = process.env.JENKINS_URL.replace(/\/+$/, "");
+
+            function toJobPath(logical) {
+              return logical.split("/").filter(Boolean).map(s => `job/${encodeURIComponent(s)}`).join("/");
+            }
+
+            async function fireJenkins(logicalJob, params) {
+              const body = new URLSearchParams();
+              for (const [k, v] of Object.entries(params)) {
+                if (v !== undefined && v !== null && v !== "") body.set(k, String(v));
+              }
+              const res = await fetch(`${jenkinsUrl}/${toJobPath(logicalJob)}/buildWithParameters`, {
+                method: "POST",
+                headers: { Authorization: auth, "Content-Type": "application/x-www-form-urlencoded" },
+                body: body.toString(),
+              });
+              if (res.status < 200 || res.status >= 400) {
+                throw new Error(`Failed to trigger ${logicalJob}: HTTP ${res.status}`);
+              }
+              console.log(`🚀 Fire-and-forget triggered ${logicalJob} (${JSON.stringify(params)})`);
+            }
+
+            async function notifyTeams(title, text, color) {
+              if (!process.env.TEAMS_WEBHOOK_URL) {
+                console.log(`[Teams Dry-Run] ${title}: ${text}`);
+                return;
+              }
+              await fetch(process.env.TEAMS_WEBHOOK_URL, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  type: "message",
+                  attachments: [{
+                    contentType: "application/vnd.microsoft.card.adaptive",
+                    content: {
+                      $schema: "http://adaptivecards.io/schemas/adaptive-card.json",
+                      type: "AdaptiveCard",
+                      version: "1.4",
+                      body: [
+                        { type: "TextBlock", text: title, weight: "Bolder", color, wrap: true },
+                        { type: "TextBlock", text, wrap: true }
+                      ]
+                    }
+                  }]
+                })
+              });
+            }
+
+            (async () => {
+              const mapped = cfg.branchToEnv[p.branch] || {};
+              const env = p.override_env || p.env || mapped.env;
+
+              if (eventType === "frontend-pr-merged-push") {
+                await fireJenkins(cfg.jenkinsJobs.ci, {
+                  BRANCH: p.branch,
+                  GIT_COMMIT: p.commit_sha,
+                  ENV: env,
+                  PR_NUMBER: p.pr_number || "",
+                });
+                return;
+              }
+
+              if (p.status && p.status !== "SUCCESS") {
+                await notifyTeams(
+                  `❌ Jenkins 失败 (${eventType}) | ${p.branch} (${env})`,
+                  `Build: ${p.build_url || "N/A"}\nStatus: ${p.status}\nPR: #${p.pr_number || "N/A"}`,
+                  "Attention"
+                );
+                process.exit(1);
+              }
+
+              if (eventType === "jenkins-ci-finished") {
+                await fireJenkins(cfg.jenkinsJobs.release, {
+                  BRANCH: p.branch,
+                  GIT_COMMIT: p.commit_sha,
+                  ENV: env,
+                  ARTIFACT_VERSION: p.artifact_version,
+                  PR_NUMBER: p.pr_number || "",
+                });
+              } else if (eventType === "jenkins-release-finished") {
+                await fireJenkins(cfg.jenkinsJobs.cd, {
+                  BRANCH: p.branch,
+                  GIT_COMMIT: p.commit_sha,
+                  ENV: env,
+                  RELEASE_VERSION: p.release_version,
+                  PR_NUMBER: p.pr_number || "",
+                });
+              } else if (eventType === "jenkins-cd-finished") {
+                await notifyTeams(
+                  `✅ 发布成功 | ${p.branch} → ${mapped.uatAlias || env} (${env})`,
+                  `Release: ${p.release_version || "N/A"}\nPreview: ${mapped.previewUrl || "N/A"}`,
+                  "Good"
+                );
+              }
+            })().catch((e) => { console.error(e); process.exit(1); });
+          '

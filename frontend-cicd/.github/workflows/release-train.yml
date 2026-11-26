@@ -1,0 +1,106 @@
+name: Scheduled Release Train (Batch Deploy)
+
+# Batches multiple merged PRs into fixed daily deployment windows (e.g. 11:30, 16:30, 20:00 UTC+8)
+# to avoid overloading Jenkins build servers on ~47m pipelines.
+# Skips automatically if no new commits exist on a release branch since its last deployed SHA.
+on:
+  schedule:
+    # UTC 03:30, 08:30, 12:00 -> Asia/Shanghai 11:30, 16:30, 20:00 (Mon-Fri)
+    - cron: "30 3,8 * * 1-5"
+    - cron: "0 12 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Specific develop-* branch to deploy (leave empty to scan all mapped branches)"
+        required: false
+        default: ""
+
+jobs:
+  check-and-dispatch:
+    runs-on: [self-hosted]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan Active Release Branches & Dispatch Changed Ones
+        env:
+          APP_REPO: ${{ vars.APP_REPO }} # e.g. my-org/frontend-app
+          APP_REPO_READ_TOKEN: ${{ secrets.APP_REPO_READ_TOKEN }}
+          CICD_DISPATCH_TOKEN: ${{ secrets.CICD_DISPATCH_TOKEN }}
+          GH_API_URL: ${{ github.api_url }}
+          TARGET_BRANCH: ${{ inputs.branch }}
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("fs");
+            const cfg = JSON.parse(fs.readFileSync("config/branch-env-map.json", "utf8"));
+            const branches = process.env.TARGET_BRANCH
+              ? [process.env.TARGET_BRANCH]
+              : Object.keys(cfg.branchToEnv);
+
+            (async () => {
+              for (const branch of branches) {
+                const refUrl = `${process.env.GH_API_URL}/repos/${process.env.APP_REPO}/git/ref/heads/${encodeURIComponent(branch)}`;
+                const refRes = await fetch(refUrl, {
+                  headers: { Authorization: `Bearer ${process.env.APP_REPO_READ_TOKEN}` },
+                });
+                if (!refRes.ok) {
+                  console.log(`Skipping ${branch} (branch not found on ${process.env.APP_REPO})`);
+                  continue;
+                }
+                const { object } = await refRes.json();
+                const headSha = object.sha;
+
+                // Compare against last dispatched SHA stored in GitHub repository variable (optional)
+                const varName = `LAST_DEPLOYED_${branch.replace(/[^A-Za-z0-9]/g, "_").toUpperCase()}`;
+                const varUrl = `${process.env.GH_API_URL}/repos/${process.env.GITHUB_REPOSITORY}/actions/variables/${varName}`;
+                const varRes = await fetch(varUrl, {
+                  headers: { Authorization: `Bearer ${process.env.CICD_DISPATCH_TOKEN}` },
+                });
+                const lastSha = varRes.ok ? (await varRes.json()).value : "";
+
+                if (lastSha === headSha && !process.env.TARGET_BRANCH) {
+                  console.log(`⏭️  ${branch} unchanged at ${headSha.slice(0, 8)} — skipping train.`);
+                  continue;
+                }
+
+                console.log(`🚆 Dispatching release train for ${branch} (${headSha.slice(0, 8)})...`);
+                const dispRes = await fetch(`${process.env.GH_API_URL}/repos/${process.env.GITHUB_REPOSITORY}/dispatches`, {
+                  method: "POST",
+                  headers: {
+                    Accept: "application/vnd.github+json",
+                    Authorization: `Bearer ${process.env.CICD_DISPATCH_TOKEN}`,
+                    "Content-Type": "application/json",
+                  },
+                  body: JSON.stringify({
+                    event_type: "frontend-pr-merged",
+                    client_payload: {
+                      app_repo: process.env.APP_REPO,
+                      branch,
+                      commit_sha: headSha,
+                      pr_number: "",
+                      pr_title: `Release Train (${branch})`,
+                      pr_url: "",
+                      author: "release-train",
+                      override_env: "",
+                    },
+                  }),
+                });
+                if (!dispRes.ok) throw new Error(`Dispatch failed for ${branch}: HTTP ${dispRes.status}`);
+
+                // Record dispatched SHA
+                const method = varRes.ok ? "PATCH" : "POST";
+                const saveUrl = varRes.ok
+                  ? varUrl
+                  : `${process.env.GH_API_URL}/repos/${process.env.GITHUB_REPOSITORY}/actions/variables`;
+                await fetch(saveUrl, {
+                  method,
+                  headers: {
+                    Accept: "application/vnd.github+json",
+                    Authorization: `Bearer ${process.env.CICD_DISPATCH_TOKEN}`,
+                    "Content-Type": "application/json",
+                  },
+                  body: JSON.stringify({ name: varName, value: headSha }),
+                });
+              }
+            })().catch((e) => { console.error(e); process.exit(1); });
+          '
