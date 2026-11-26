@@ -28,7 +28,7 @@
 2. 识别 `../company-cicd-repo` 中已有的 Jenkinsfile、环境列表（如 env1-env5, sim）和真实的 3 个 Jenkins Job 路径与入参名称（dev 下的 CI/Release、uat 下的 CD）；
 3. 识别我们现有的分支命名规范（如 develop-YYYYMM 对应 uatX）；
 4. 严格遵守以下约束：
-   - PR 门禁不跑 build，只跑 ggshield + oxlint/eslint + commit message 校验 + PR 级 vitest related（改动全局配置时才兜底全量）；
+   - 单点门禁（不重复跑两遍）：本地 `pre-commit` 仅保留 `<1s` 的 `ggshield` 防止密文被 push；`oxlint`/`eslint` + commit message 校验 + PR 级 `vitest related`（改动全局配置时兜底全量）统一在 GHES PR Gate 跑一遍，不跑 build；
    - 我们无 Jenkins 管理员权限，不得要求安装 Jenkins 插件；
    - 公司未开启 Copilot MCP，采用合规的仓库只读 CLI 脚本（jenkins-inspect.mjs），不得尝试绕过或伪装 MCP；
    - 凭据隔离：Jenkins Token 与 Teams Webhook 仅放在 CICD 仓库 Secrets 中；

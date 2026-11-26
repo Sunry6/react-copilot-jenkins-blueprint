@@ -10,7 +10,7 @@
 
 针对典型的企业 React 前端研发模式：
 - **分支与环境强绑定**：每个月度 Release 对应一个开发分支和一套 UAT 环境（例如 `develop-202701` → `env3 / uat3`，在 [`frontend-cicd/config/branch-env-map.json`](frontend-cicd/config/branch-env-map.json) 中统一配置）。
-- **无 Build 的极速 PR 硬门禁**：本地提交与 GHES PR 门禁保持一致（`ggshield` + `oxlint` + `eslint` + `commitlint` + `vitest related`），**不跑 build**；通过 GHES Rulesets 物理锁死 Merge 按钮，彻底防 `--no-verify` 绕过。
+- **无重复做功的单点 PR 硬门禁（不跑 Build）**：本地 `pre-commit` 极简仅保留 `<1s` 的 `ggshield`（防密文在 `push` 前泄露）；`oxlint` + `eslint` + `commitlint` + PR 级 `vitest related` **只在 GHES PR Gate 跑一遍**，由 Rulesets 物理锁死 Merge 按钮，既不卡本地提交又无法 `--no-verify` 绕过。
 - **双仓隔离（App 仓 + 独立 CICD 仓）**：Jenkins Token 与 Teams Webhook 仅保存在 `frontend-cicd` 仓库，业务代码仓零部署凭据。
 - **低权限串联 3 个现有 Jenkins Job**：PR 合并后自动按序触发 `dev/<app>-ci` → `dev/<app>-release` → `uat/<app>-cd`，精确传递产物/版本号，**无需 Jenkins 管理员权限或安装插件**。
 - **外部手动占坑检测与自动避让**：触发前主动查询 Jenkins 运行中 Build 与 Queue，若同事正在手动跑同一环境，自动打印占用者并礼貌等待，**绝不冲突、绝不串号**。
@@ -23,7 +23,7 @@
 ```text
 react-copilot-jenkins-blueprint/
 ├── frontend-app/                       # React + Vite + TS 业务仓库模板
-│   ├── .husky/                         # 本地极速门禁（staged ggshield + lint-staged + commitlint）
+│   ├── .husky/                         # 极简本地 pre-commit（仅 <1s ggshield，不重复跑 lint/UT）
 │   ├── .github/
 │   │   ├── copilot-instructions.md     # 无 MCP 合规 Copilot 工程规范
 │   │   ├── skills/ship-pr/SKILL.md     # Copilot 一键自测并提 PR 技能
@@ -50,11 +50,11 @@ react-copilot-jenkins-blueprint/
 
 ```text
 Copilot Desktop / CLI (本地开发)
-  │  1. 本地快检: staged ggshield + oxlint/eslint + commitlint + vitest related
+  │  1. 本地提交仅跑 <1s ggshield（防密文 push），不重复卡顿
   │  2. 提 PR 至 develop-202701
   ▼
 GHES PR 硬门禁 (frontend-app/.github/workflows/pr-gate.yml)
-  │  3. 强制通过: ggshield + oxlint/eslint + commitlint + PR 级 vitest related + Leader Approve
+  │  3. 单点权威裁判: ggshield + oxlint/eslint + commitlint + PR 级 vitest related + Leader Approve
   │     (未全绿前 Merge 按钮物理锁死；不跑 build)
   ▼
 Leader 点击 Merge ──▶ trigger-cicd.yml (跨仓 repository_dispatch)
