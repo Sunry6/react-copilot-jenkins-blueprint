@@ -1,0 +1,92 @@
+name: PR Quality Gate (No Build)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - "develop-*"
+      - "main"
+
+jobs:
+  # 1. Secret scan (cannot be bypassed by local --no-verify)
+  secret-scan:
+    name: ggshield Secret Scan
+    runs-on: [self-hosted]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Run ggshield on PR commit range
+        env:
+          GITGUARDIAN_API_KEY: ${{ secrets.GITGUARDIAN_API_KEY }}
+        run: |
+          if command -v ggshield >/dev/null 2>&1 && [ -n "${GITGUARDIAN_API_KEY:-}" ]; then
+            ggshield secret scan commit-range "origin/${GITHUB_BASE_REF}..HEAD"
+          else
+            echo "Configure GITGUARDIAN_API_KEY and ggshield on your GHES runner."
+          fi
+
+  # 2. Commit message convention check
+  commit-lint:
+    name: Commit Message Check
+    runs-on: [self-hosted]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Validate all PR commits
+        run: npx commitlint --from "origin/${GITHUB_BASE_REF}" --to HEAD --verbose
+
+  # 3. oxlint + eslint
+  lint:
+    name: Oxlint & ESLint
+    runs-on: [self-hosted]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+
+  # 4. PR-scoped vitest related (no build step; falls back to full UT only when global config/deps change)
+  unit-test-related:
+    name: Vitest Related UT
+    runs-on: [self-hosted]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Run Vitest on PR-changed files (auto full-fallback for config changes)
+        run: |
+          set -euo pipefail
+          ALL_CHANGED=$(git diff --name-only --diff-filter=ACMR "origin/${GITHUB_BASE_REF}...HEAD")
+          echo "Changed files in PR:"
+          echo "$ALL_CHANGED"
+
+          # Global config/dependency changes escape static import graph -> run full suite as safety net
+          if echo "$ALL_CHANGED" | grep -qE '^(package\.json|package-lock\.json|pnpm-lock\.yaml|yarn\.lock|vite\.config\.|vitest\.config\.|tsconfig\.json)'; then
+            echo "⚠️  Global config/dependency changed -> running full Vitest suite"
+            npm test
+            exit 0
+          fi
+
+          CODE_CHANGED=$(echo "$ALL_CHANGED" | grep -E '\.(ts|tsx|js|jsx)$' || true)
+          if [ -z "$CODE_CHANGED" ]; then
+            echo "No JS/TS source changes; skipping Vitest related."
+            exit 0
+          fi
+
+          # shellcheck disable=SC2086
+          npx vitest related $CODE_CHANGED --run --passWithNoTests

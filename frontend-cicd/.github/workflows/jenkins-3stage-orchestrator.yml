@@ -1,0 +1,135 @@
+name: Jenkins 3-Stage Orchestrator (CI -> Release -> CD)
+
+on:
+  # Triggered automatically by frontend-app when a PR merges into develop-YYYYMM
+  repository_dispatch:
+    types: [frontend-pr-merged]
+
+  # Manual trigger OR resume from any failed stage (ci | release | cd)
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Release branch (e.g. develop-202701)"
+        required: true
+        default: "develop-202701"
+      override_env:
+        description: "Optional env override (leave empty to use branch-env-map.json)"
+        required: false
+        default: ""
+      start_from:
+        description: "Stage to start/resume from"
+        required: true
+        default: "ci"
+        type: choice
+        options:
+          - ci
+          - release
+          - cd
+      commit_sha:
+        description: "Exact Git commit SHA"
+        required: false
+        default: ""
+      artifact_version:
+        description: "Required when resuming from release"
+        required: false
+        default: ""
+      release_version:
+        description: "Required when resuming from cd"
+        required: false
+        default: ""
+
+# Per-branch/env serialization: different release branches run in parallel,
+# while merges to the SAME release branch queue strictly without cancelling in-flight deploys!
+concurrency:
+  group: jenkins-3stage-${{ github.event.client_payload.override_env || github.event.client_payload.branch || inputs.override_env || inputs.branch }}
+  cancel-in-progress: false
+
+jobs:
+  orchestrate:
+    runs-on: [self-hosted]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Run 3-Stage Jenkins Pipeline (CI -> Release -> CD) with Conflict Avoidance
+        id: run_pipeline
+        env:
+          JENKINS_URL: ${{ secrets.JENKINS_URL }}
+          JENKINS_USER: ${{ secrets.JENKINS_USER }}
+          JENKINS_API_TOKEN: ${{ secrets.JENKINS_API_TOKEN }}
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          TARGET_BRANCH: ${{ github.event.client_payload.branch || inputs.branch }}
+          TARGET_COMMIT: ${{ github.event.client_payload.commit_sha || inputs.commit_sha }}
+          OVERRIDE_ENV: ${{ github.event.client_payload.override_env || inputs.override_env }}
+          START_FROM: ${{ inputs.start_from || 'ci' }}
+          PR_NUMBER: ${{ github.event.client_payload.pr_number || '' }}
+          PR_URL: ${{ github.event.client_payload.pr_url || '' }}
+          PR_AUTHOR: ${{ github.event.client_payload.author || github.actor }}
+          ARTIFACT_VERSION: ${{ inputs.artifact_version || '' }}
+          RELEASE_VERSION: ${{ inputs.release_version || '' }}
+          RESUME_URL: ${{ github.server_url }}/${{ github.repository }}/actions/workflows/jenkins-3stage-orchestrator.yml
+        run: |
+          set -euo pipefail
+          EXTRA_ARGS=()
+          [ -n "${OVERRIDE_ENV}" ] && EXTRA_ARGS+=(--env "${OVERRIDE_ENV}")
+          [ -n "${ARTIFACT_VERSION}" ] && EXTRA_ARGS+=(--artifact-version "${ARTIFACT_VERSION}")
+          [ -n "${RELEASE_VERSION}" ] && EXTRA_ARGS+=(--release-version "${RELEASE_VERSION}")
+
+          node scripts/jenkins-orchestrator.mjs \
+            --branch "${TARGET_BRANCH}" \
+            --commit "${TARGET_COMMIT}" \
+            --start-from "${START_FROM}" \
+            --pr-number "${PR_NUMBER}" \
+            --pr-url "${PR_URL}" \
+            --author "${PR_AUTHOR}" \
+            --resume-url "${RESUME_URL}" \
+            --output-json pipeline-result.json \
+            "${EXTRA_ARGS[@]}"
+
+      - name: Post Result Comment Back to Original App PR (for Copilot Desktop My Work)
+        if: always() && github.event_name == 'repository_dispatch' && github.event.client_payload.pr_number != ''
+        env:
+          APP_REPO_COMMENT_TOKEN: ${{ secrets.APP_REPO_COMMENT_TOKEN }}
+          APP_REPO: ${{ github.event.client_payload.app_repo }}
+          PR_NUMBER: ${{ github.event.client_payload.pr_number }}
+          PR_AUTHOR: ${{ github.event.client_payload.author }}
+          GH_API_URL: ${{ github.api_url }}
+        run: |
+          if [ -z "${APP_REPO_COMMENT_TOKEN:-}" ] || [ ! -f pipeline-result.json ]; then
+            exit 0
+          fi
+          BODY=$(node -e '
+            const fs = require("fs");
+            const r = JSON.parse(fs.readFileSync("pipeline-result.json", "utf8"));
+            if (r.status === "SUCCESS") {
+              console.log([
+                `### 🚀 3-Stage Jenkins Pipeline Succeeded (\`${r.branch}\` → \`${r.uatAlias}/${r.env}\`)`,
+                `- Artifact: \`${r.artifactVersion}\``,
+                `- Release: \`${r.releaseVersion}\``,
+                `- Preview: ${r.previewUrl || r.lastBuildUrl}`,
+              ].join("\n"));
+            } else {
+              console.log([
+                `### ❌ Jenkins Pipeline Failed at \`${r.failedStage}\` (@${process.env.PR_AUTHOR})`,
+                `- Branch / Env: \`${r.branch}\` → \`${r.uatAlias}/${r.env}\``,
+                `- Failed Build: ${r.buildUrl || "N/A"}`,
+                `- Inspect with Copilot CLI (No MCP): \`npm run jenkins:log -- --job ${r.failedStage} --build ${r.buildNumber || "lastFailedBuild"}\``,
+                "",
+                "<details><summary>Error excerpt</summary>",
+                "",
+                "```text",
+                (r.errorExcerpt || r.error || "").slice(-2500),
+                "```",
+                "</details>",
+              ].join("\n"));
+            }
+          ')
+
+          curl -fsSL -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${APP_REPO_COMMENT_TOKEN}" \
+            "${GH_API_URL}/repos/${APP_REPO}/issues/${PR_NUMBER}/comments" \
+            -d "$(node -e 'console.log(JSON.stringify({ body: process.argv[1] }))' "$BODY")"

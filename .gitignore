@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.log
+pipeline-result.json
+local-sandbox/jenkins_home/
+.env
+.env.*
+.DS_Store

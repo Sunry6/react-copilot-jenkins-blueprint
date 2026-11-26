@@ -1,0 +1,30 @@
+{
+  "description": "Maps each monthly release branch (develop-YYYYMM) to its dedicated UAT/SIM environment and Jenkins 3-stage job paths.",
+  "jenkinsJobs": {
+    "ci": "dev/react-demo-ci",
+    "release": "dev/react-demo-release",
+    "cd": "uat/react-demo-cd"
+  },
+  "branchToEnv": {
+    "develop-202701": {
+      "env": "env3",
+      "uatAlias": "uat3",
+      "previewUrl": "https://env3.uat.example.internal/"
+    },
+    "develop-202702": {
+      "env": "env4",
+      "uatAlias": "uat4",
+      "previewUrl": "https://env4.uat.example.internal/"
+    },
+    "develop-202703": {
+      "env": "env5",
+      "uatAlias": "uat5",
+      "previewUrl": "https://env5.uat.example.internal/"
+    },
+    "develop-sim": {
+      "env": "sim",
+      "uatAlias": "sim",
+      "previewUrl": "https://sim.uat.example.internal/"
+    }
+  }
+}

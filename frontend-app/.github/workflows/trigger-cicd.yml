@@ -1,0 +1,60 @@
+name: Notify CICD Repo After PR Merge
+
+# Runs ONLY after all PR gates passed + Leader approved + PR is actually merged into develop-*
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - "develop-*"
+
+jobs:
+  dispatch-to-cicd:
+    if: github.event.pull_request.merged == true
+    runs-on: [self-hosted]
+    steps:
+      - name: Dispatch deployment event to dedicated CICD repository
+        env:
+          # Fine-grained PAT / GitHub App token with ONLY repository_dispatch permission on CICD repo.
+          # Notice: NO Jenkins credentials ever live in the frontend app repo!
+          CICD_DISPATCH_TOKEN: ${{ secrets.CICD_DISPATCH_TOKEN }}
+          CICD_REPO: ${{ vars.CICD_REPO }} # e.g. my-org/frontend-cicd
+          GH_API_URL: ${{ github.api_url }} # Automatically points to your internal GHES API URL
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          set -euo pipefail
+          OVERRIDE_ENV=$(node -e "
+            const labels = JSON.parse(process.env.PR_LABELS_JSON || '[]');
+            const found = labels.find(l => l.startsWith('deploy:'));
+            console.log(found ? found.replace('deploy:', '') : '');
+          ")
+
+          if [ "$OVERRIDE_ENV" = "skip" ]; then
+            echo "PR labeled with deploy:skip — skipping automatic Jenkins pipeline."
+            exit 0
+          fi
+
+          PAYLOAD=$(node -e "
+            console.log(JSON.stringify({
+              event_type: 'frontend-pr-merged',
+              client_payload: {
+                app_repo: process.env.GITHUB_REPOSITORY,
+                branch: '${{ github.base_ref }}',
+                commit_sha: '${{ github.event.pull_request.merge_commit_sha }}',
+                pr_number: '${{ github.event.pull_request.number }}',
+                pr_title: process.env.PR_TITLE,
+                pr_url: '${{ github.event.pull_request.html_url }}',
+                author: '${{ github.event.pull_request.user.login }}',
+                merged_by: '${{ github.event.pull_request.merged_by.login }}',
+                override_env: '${OVERRIDE_ENV}'
+              }
+            }));
+          ")
+
+          curl -fsSL -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${CICD_DISPATCH_TOKEN}" \
+            "${GH_API_URL}/repos/${CICD_REPO}/dispatches" \
+            -d "$PAYLOAD"
+
+          echo "✅ Dispatched merge event for PR #${{ github.event.pull_request.number }} (${{ github.base_ref }}) -> ${CICD_REPO}"

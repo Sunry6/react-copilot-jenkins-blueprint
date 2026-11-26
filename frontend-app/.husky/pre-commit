@@ -1,0 +1,12 @@
+#!/usr/bin/env sh
+set -e
+
+# 1. Secret leak scan on staged files (runs if ggshield is installed)
+if command -v ggshield >/dev/null 2>&1; then
+  ggshield secret scan pre-commit
+else
+  echo "⚠️  ggshield not installed locally (will still be enforced in PR Gate CI)"
+fi
+
+# 2. Fast incremental oxlint + eslint + vitest related on staged files only
+npx lint-staged
