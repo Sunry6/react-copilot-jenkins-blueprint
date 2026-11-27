@@ -15,6 +15,16 @@ describe("calculateCartTotal", () => {
     ).toBe(72);
   });
 
+  it("applies VIP20 coupon as an extra 20% off", () => {
+    expect(calculateCartTotal([{ price: 100, qty: 1 }], { couponCode: "VIP20" })).toBe(80);
+    expect(
+      calculateCartTotal([{ price: 100, qty: 1 }], {
+        discountPercent: 10,
+        couponCode: "VIP20",
+      })
+    ).toBe(72);
+  });
+
   it("floors FLAT5 coupon at zero", () => {
     expect(calculateCartTotal([{ price: 3, qty: 1 }], { couponCode: "FLAT5" })).toBe(0);
   });
